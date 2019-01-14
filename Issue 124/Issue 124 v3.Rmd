@@ -1,0 +1,255 @@
+---
+title: "Issue #124 v.2"
+author: "Lauti Cantar"
+date: "11/27/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, 
+                      warning = FALSE, 
+                      message = FALSE)
+
+# Loading packages
+library(tidyverse)
+library(readxl)
+library(rvest)
+library(sf)
+library(DT)
+library(knitr)
+
+'%!in%' <- function(x,y)!('%in%'(x,y))
+
+```
+
+## Objetivo final:
+El objetivo final de este asunto es agregar el endpoint `países` atributos adicionales y polígonos (de ser posible).
+
+## Flujo de trabajo:
+Utilizando la información geográfica oficial (proveniente de INDEC o del IGN) disponible a la fecha mas información adicional (proveniente de diversas fuentes) un listado lo mas representativo posible de los países. Una vez realizado este proceso, se elige que variables se van a utilizar para generar un archivo final a ser incorporado al endpoint.
+
+
+## Fuentes de datos al momento:
+
+Las fuentes de datos disponibles a la fecha son las siguientes:
+
+* **Fuentes oficiales Argentina:**
+    - El [SHP de IGN](http://wms.ign.gob.ar/geoserver/idera/ows?service=WFS&version=1.0.0&request=GetFeature&typeName=idera:pais&outputFormat=SHAPE-ZIP) que contempla polígonos y nombres.
+    - El [XLS de INDEC](https://www.indec.gov.ar/ftp/cuadros/territorio/codigo_paises.xls) que contempla código INDEC, ISO 3166-1 alfa 3 y nombre de los países, pero no hace referencia a ninguna capa con polígonos.
+    - El listado de [Comercio Exterior del COMEX INDEC](https://comex.indec.gob.ar/public-api/dlc/paises.xls) que contempla el código INDEC y el nombre del país.
+* **Fuentes internacionales de comparación:**
+    - La [ISO 3166](https://www.iso.org/obp/ui/#search) que contempla ID, alfa 2 y alfa 3.
+    - La lista de [COMTRADE](https://unstats.un.org/unsd/tradekb/Knowledgebase/50377/Comtrade-Country-Code-and-Name), ver los que tienen validez "now".
+
+### 1. Datos del INDEC
+
+#### 1.1. Archivo base de INDEC
+
+```{r}
+# -------------------------------------------------------------------------------------------------------------------------------
+#                                                   1. Datos INDEC
+# -------------------------------------------------------------------------------------------------------------------------------
+
+# Abriendo los datos
+indec <- read_excel("codigo_paises.xls", skip = 4, 
+                    col_names = c("NOMBRE_DE_USO_COMÚN", "NOMBRE_CORTO", "NOMBRE_LARGO", "ABREVIATURA_ISO", "CÓDIGO_INDEC"),
+                    sheet = 1)
+
+# Limpiando el dataset
+indec <- indec %>% 
+  filter(!is.na(NOMBRE_DE_USO_COMÚN)) %>% # Borrando los NAs en la columna Nombre_de_uso_comun
+  filter(!is.na(CÓDIGO_INDEC)) %>% 
+  mutate(Nombre_generico = case_when(grepl("Indeterminado", NOMBRE_DE_USO_COMÚN) ~ 1,
+                                     grepl("Resto", NOMBRE_DE_USO_COMÚN) ~ 1,
+                                     grepl("Sin declarar", NOMBRE_DE_USO_COMÚN) ~ 1))
+```
+
+
+El archivo `indec` tiene `r nrow(indec)` observaciones y las 5 variables:
+
+* _"NOMBRE DE USO COMÚN"_: Fuente: INDEC
+* _"NOMBRE CORTO"_: Fuente: Elaboración propia en base a ONU, IGN, Cancillería y consultas a embajadas.
+* _"NOMBRE LARGO"_: Fuente: Elaboración propia en base a ONU, IGN, Cancillería y consultas a embajadas.
+* _"ABREVIATURA ISO"_: ISO 3166-1 alfa 3
+* _"CÓDIGO INDEC"_ Fuente: INDEC
+
+Del total de observaciones, `r sum(indec$Nombre_generico == 1, na.rm = TRUE)` poseen un `CÓDIGO INDEC` pero son del tipo _"Indeterminado (Nombre Continente)"_, _"Resto (Nombre Continente)"_ o _"Sin declarar (Nombre Continente)"_. Dado que no hacen referencia a un paiís concreto, se descarta dichas observaciones. Por lo tanto, el dataset resultante contiene `r nrow(indec) - sum(indec$Nombre_generico == 1, na.rm = TRUE)` observaciones.
+
+#### 1.2. Zonas Francas INDEC
+
+```{r}
+# Abriendo el dataset de Zonas Francas
+zonas.francas <- read_excel("ZF_CE_PAIS_SECEX.xlsx",
+                            col_names = c("CÓDIGO_INDEC", "NOMBRE_ZONA_FRANCA"))[-1,]
+
+zonas.francas$CÓDIGO_INDEC <- as.numeric(zonas.francas$CÓDIGO_INDEC)
+
+# Merge
+indec <- indec %>% 
+  filter(!grepl("Indeterminado", NOMBRE_DE_USO_COMÚN)) %>% 
+  filter(!grepl("Resto", NOMBRE_DE_USO_COMÚN)) %>% 
+  filter(!grepl("Sin declarar", NOMBRE_DE_USO_COMÚN)) %>% 
+  left_join(zonas.francas, by = "CÓDIGO_INDEC")
+
+no.incluidas.zonas <- zonas.francas %>% filter(zonas.francas$CÓDIGO_INDEC %!in% indec$CÓDIGO_INDEC)
+```
+
+Al analizar el archivo base de INDEC, hay observaciones que hacen referencia a Zonas Francas de distintos paises. Contrastar esta informacion, utilizamos un archivo provisto por INDEC en el cual se detallan las zonas francas. Dicho documento tienen `r nrow(zonas.francas)` observaciones y dos variables:
+
+* _"CÓDIGO INDEC"_ Fuente: INDEC
+* _"NOMBRE DE USO COMÚN"_: Fuente: INDEC
+
+Utilizando el `CÓDIGO INDEC` unimos ambos set de datos y descartamos las observaciones que se cruzan, manteniendo `r sum(is.na(indec$NOMBRE_ZONA_FRANCA))` observaciones. Hay `r nrow(no.incluidas.zonas)` que no se pueden cruzar:
+
+```{r}
+no.incluidas.zonas %>% kable(caption = "Zonas Francas no incluidos")
+```
+
+
+#### 1.3. COMEX INDEC
+
+```{r}
+# -------------------------------------------------------------------------------------------------------------------------------
+#                                                   1.1. INDEC - Comercio Exterior
+# -------------------------------------------------------------------------------------------------------------------------------
+
+# Abriendo el dataset de Zonas Francas
+comex <- read_excel("paises.xls", col_names = c("CÓDIGO_INDEC", "NOMBRE_PAIS_COMEX"))[-c(1:5, 282:285),]
+
+comex$CÓDIGO_INDEC <- as.numeric(comex$CÓDIGO_INDEC)
+
+comex <- comex %>% 
+  filter(!grepl("Indeterminado", NOMBRE_PAIS_COMEX)) %>% 
+  filter(!grepl("Resto", NOMBRE_PAIS_COMEX)) %>% 
+  filter(!grepl("Sin declarar", NOMBRE_PAIS_COMEX))
+
+
+# Merge
+indec <- indec %>% 
+  left_join(comex, by = "CÓDIGO_INDEC")
+
+no.incluidas.comex <- comex %>% filter(comex$CÓDIGO_INDEC %!in% indec$CÓDIGO_INDEC) %>% arrange(NOMBRE_PAIS_COMEX)
+```
+
+Para validar los resultados obtenidos hasta el momento, utilizamos la base de paises que utiliza el INDEC para trabajar en Comercio Exterior. El archivo de `COMEX INDEC`, contiene `r nrow(comex)` observaciones Al hacer el cruce, hay `r nrow(no.incluidas.comex)` casos que no se pueden cruzar. De dichos casos, el más curioso es el de **Sudan**, ya que en esta duplicado con dos Codigos INDEC diferente: 138 y 162.
+
+```{r}
+no.incluidas.comex %>% kable(caption = "COMEX INDEC no incluidos")
+```
+
+#### 1.4. Tabla final Datos INDEC
+
+```{r}
+indec <- indec %>% 
+  filter(is.na(NOMBRE_ZONA_FRANCA)) %>% 
+  select(-c(Nombre_generico, NOMBRE_ZONA_FRANCA))
+
+indec$NOMBRE_CORTO <- gsub("\\s*\\([^\\)]+\\)", "", indec$NOMBRE_CORTO)
+```
+
+El set de datos final contiene `r nrow(indec)` filas y se lo puede encontrar (y descargar) aqui.
+
+```{r}
+indec %>% datatable(extensions = 'Buttons', options = list(dom = 'Brtp', buttons = c('csv', 'pdf')))
+```
+
+### 2. Datos IGN 
+
+```{r, warning=FALSE, message=FALSE}
+archivo.ign <- read_csv("archivo_ign.csv", 
+                        col_names = c("IGN_NOMRBRE_LARGO", "IGN_NOMBRE_CORTO"), 
+                        skip = 1)
+
+indec <- indec %>% left_join(archivo.ign, by = c("NOMBRE_CORTO" = "IGN_NOMBRE_CORTO"))
+```
+
+El archivo `.shp` del Instituto Geografico Nacional posee originalmente 8 variables y 295 observaciones. Dado la naturaleza de este analisis, vamos a trabajar únicamente con `r nrow(archivo.ign)` obervaciones y dos variables: 
+
+* `fna`, renombrada como `IGN_NOMRBRE_LARGO`
+* `nam`, renombrada como `IGN_NOMRBRE_CORTO`
+
+Al unir esta base con la base que hemos elaborado con la infomacion de INDEC, obtenemos el siguiente archivo:
+
+```{r, warning=FALSE, message=FALSE}
+indec %>% datatable(extensions = 'Buttons', options = list(dom = 'Brtp', buttons = c('csv', 'pdf')))
+```
+
+### 3. Bases Externas
+
+#### 3.1. Datos ISO:3166
+
+El archivo base tiene la variable _"ABREVIATURA ISO"_ que contiene el valor Alpha-3 de la ISO:3166. Desarrollamos un scrapper muy basico de la siguiente pagina de [Wikipedia](https://es.wikipedia.org/wiki/ISO_3166-1)
+
+El dataset resultante es la siguiente tabla:
+
+```{r}
+iso3166 <- read_csv("iso3166.csv")
+
+# Merge datos ISO:3166 e INDEC
+indec <- indec %>% left_join(iso3166 %>% select(Nombre_ISO_oficial, Codigo_Alfa2, Codigo_Alfa3),
+                               by = c("ABREVIATURA_ISO" = "Codigo_Alfa3" ))
+
+indec %>% datatable(extensions = 'Buttons', options = list(dom = 'Brtp', buttons = c('csv', 'pdf')))
+
+nas <- table(!is.na(indec$IGN_NOMRBRE_LARGO))
+
+```
+
+#### 3.2. COMTRADE
+
+```{r}
+# -------------------------------------------------------------------------------------------------------------------------------
+#                                                   4. Datos COMTRADE
+# -------------------------------------------------------------------------------------------------------------------------------
+
+# Abriendo dataset
+comtrade <- read_excel("Comtrade Country Code and ISO list.xlsx")
+
+# Filtrando datos
+comtrade <- comtrade %>% 
+  filter(`End Valid Year` ==  "Now") %>%        # Seleccionando solo los datos que sean Validos "NOW"
+  filter(`ISO3-digit Alpha`!= "N/A")
+  
+indec <- indec %>% left_join(comtrade %>%
+                               select(`Country Name, Full`, `ISO3-digit Alpha`) %>%
+                               rename(COMTRADE.NOMBRE = `Country Name, Full`,
+                                      ISO.ALPHA.3 = `ISO3-digit Alpha`), 
+                             by = c("ABREVIATURA_ISO" = "ISO.ALPHA.3"))
+```
+
+### 4. Listado final
+
+Para la elaboracion del archivo final, se descartan aquellas observaciones que no tienen ningun dato en la columna `NOMBRE_CORTO`. Las observaciones que se eliminan son las siguientes:
+
+```{r}
+sin.dato.indec <- indec %>%
+  filter(is.na(NOMBRE_CORTO))
+
+sin.dato.indec %>% kable(caption = "Observaciones eliminadas por NA")
+```
+
+```{r}
+indec.3 <- indec %>% 
+  filter(!is.na(NOMBRE_CORTO)) %>% 
+  select(NOMBRE_LARGO, Nombre_ISO_oficial, ABREVIATURA_ISO, CÓDIGO_INDEC) %>% 
+  mutate(NOMBRE_LARGO = gsub("^(la|el) ", "", NOMBRE_LARGO)) %>% 
+  rename(INDEC_NOMBRE_LARGO = NOMBRE_LARGO,
+         ISO_NOMBRE_OFICIAL = Nombre_ISO_oficial,
+         ISO_ALPHA_3 = ABREVIATURA_ISO, 
+         CÓDIGO_INDEC = CÓDIGO_INDEC)
+
+```
+
+El listado definitivo contiene `r nrow(indec.3)` y las siguientes variables:
+
+* `INDEC_NOMBRE_LARGO`: Nombre Largo del Pais segund INDEC,
+* `ISO_NOMBRE_OFICIAL`: Nombre del Pais segun ISO:3166,
+* `ISO_ALPHA_3`: Codigo de 3 digitos segun ISO:3166,
+* `CÓDIGO_INDEC`: Codigo Numerico INDEC
+
+Se lo puede descargar desde aqui:
+
+```{r}
+indec.3 %>% datatable(extensions = 'Buttons', options = list(dom = 'Brtp', buttons = c('csv', 'pdf')))
+```
+
